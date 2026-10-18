@@ -692,19 +692,10 @@ impl MeridianVault {
     /// so a record left behind by a full transfer-out is never reported as
     /// a live position.
     ///
-    /// `on_transfer` clears a sender's record itself the moment a full
-    /// transfer-out reaches zero, so a leftover record found here should be
-    /// unreachable in the current system; this self-heal is kept as a
-    /// defensive fallback for any balance that reached zero another way
-    /// this contract doesn't yet account for (and for state left behind by
-    /// mUSDC's pre-#578 life as a plain Stellar Asset Contract with no
-    /// transfer hook at all, before a live-holder migration if one hasn't
-    /// run yet). Clearing it here means it can never resurface as a stale
-    /// basis/entry time if this address's balance later becomes nonzero
-    /// again through an unrelated deposit or transfer-in.
+    /// Cleared on a full withdrawal or transfer-out so a later re-deposit starts a
+    /// fresh clock. An address that holds zero shares always reports 0 here.
     pub fn get_entry_time(env: Env, address: Address) -> u64 {
         if Self::get_position(env.clone(), address.clone()) == 0 {
-            clear_position_records(&env, &address);
             return 0;
         }
         let key = DataKey::Entry(address);
@@ -726,15 +717,8 @@ impl MeridianVault {
     /// here because it holds nothing, rather than a stale basis for shares
     /// it no longer has — `on_transfer` clears both records itself the
     /// moment a full transfer-out reaches zero.
-    ///
-    /// Like `get_entry_time`, the self-heal below (clearing a zero-position
-    /// holder's leftover record) should be unreachable in the current
-    /// system; it's kept as a defensive fallback, and as a bridge for
-    /// records left over from mUSDC's pre-#578 life as a plain SAC before a
-    /// live-holder migration, if one hasn't run yet.
     pub fn get_principal(env: Env, address: Address) -> i128 {
         if Self::get_position(env.clone(), address.clone()) == 0 {
-            clear_position_records(&env, &address);
             return 0;
         }
         let key = DataKey::Principal(address);
@@ -2557,6 +2541,60 @@ mod tests {
 
         assert_eq!(vault.get_position(&stranger), 0);
         assert_eq!(TokenClient::new(&env, &musdc_id).balance(&stranger), 0);
+    }
+
+    #[test]
+    fn get_entry_time_and_get_principal_are_pure_views_without_storage_writes() {
+        let (env, _admin, _user, _usdc, _musdc_id, _adapter, vault) = setup();
+        let stranger = Address::generate(&env);
+
+        // Address with no position has no storage keys
+        assert_eq!(vault.get_position(&stranger), 0);
+        let entry_key = DataKey::Entry(stranger.clone());
+        let principal_key = DataKey::Principal(stranger.clone());
+        assert!(!env.as_contract(&vault.address, || env.storage().persistent().has(&entry_key)));
+        assert!(!env.as_contract(&vault.address, || env.storage().persistent().has(&principal_key)));
+
+        // Views return 0
+        assert_eq!(vault.get_entry_time(&stranger), 0);
+        assert_eq!(vault.get_principal(&stranger), 0);
+
+        // Still no keys created — views do not touch storage
+        assert!(!env.as_contract(&vault.address, || env.storage().persistent().has(&entry_key)));
+        assert!(!env.as_contract(&vault.address, || env.storage().persistent().has(&principal_key)));
+    }
+
+    #[test]
+    fn get_entry_time_and_get_principal_do_not_clear_records_during_read() {
+        let (env, _admin, _user, usdc_id, _musdc_id, _adapter, vault) = setup();
+        let stranger = Address::generate(&env);
+
+        let entry_key = DataKey::Entry(stranger.clone());
+        let principal_key = DataKey::Principal(stranger.clone());
+
+        // Manually populate stale position records for a zero-share address
+        env.as_contract(&vault.address, || {
+            env.storage().persistent().set(&entry_key, &12_345_u64);
+            env.storage().persistent().set(&principal_key, &100_0000000_i128);
+        });
+
+        // Views return 0 because position is 0
+        assert_eq!(vault.get_position(&stranger), 0);
+        assert_eq!(vault.get_entry_time(&stranger), 0);
+        assert_eq!(vault.get_principal(&stranger), 0);
+
+        // Crucially, views must NOT clear or write storage during the read
+        assert!(env.as_contract(&vault.address, || env.storage().persistent().has(&entry_key)));
+        assert!(env.as_contract(&vault.address, || env.storage().persistent().has(&principal_key)));
+
+        // State-changing deposit clears stale records before setting fresh ones
+        StellarAssetClient::new(&env, &usdc_id).mint(&stranger, &50_0000000_i128);
+        env.ledger().with_mut(|li| li.timestamp = 99_999);
+        vault.deposit(&stranger, &50_0000000_i128, &0_i128);
+
+        // Now has new clean position
+        assert_eq!(vault.get_entry_time(&stranger), 99_999);
+        assert_eq!(vault.get_principal(&stranger), 50_0000000_i128);
     }
 
     #[test]
