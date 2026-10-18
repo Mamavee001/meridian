@@ -692,19 +692,11 @@ impl MeridianVault {
     /// so a record left behind by a full transfer-out is never reported as
     /// a live position.
     ///
-    /// `on_transfer` clears a sender's record itself the moment a full
-    /// transfer-out reaches zero, so a leftover record found here should be
-    /// unreachable in the current system; this self-heal is kept as a
-    /// defensive fallback for any balance that reached zero another way
-    /// this contract doesn't yet account for (and for state left behind by
-    /// mUSDC's pre-#578 life as a plain Stellar Asset Contract with no
-    /// transfer hook at all, before a live-holder migration if one hasn't
-    /// run yet). Clearing it here means it can never resurface as a stale
-    /// basis/entry time if this address's balance later becomes nonzero
-    /// again through an unrelated deposit or transfer-in.
+    /// This function is a pure view and does not mutate storage. Cleanup of
+    /// stale records for zero-share addresses occurs during state-changing
+    /// operations (`deposit`, `withdraw`, `on_transfer`).
     pub fn get_entry_time(env: Env, address: Address) -> u64 {
         if Self::get_position(env.clone(), address.clone()) == 0 {
-            clear_position_records(&env, &address);
             return 0;
         }
         let key = DataKey::Entry(address);
@@ -727,14 +719,11 @@ impl MeridianVault {
     /// it no longer has — `on_transfer` clears both records itself the
     /// moment a full transfer-out reaches zero.
     ///
-    /// Like `get_entry_time`, the self-heal below (clearing a zero-position
-    /// holder's leftover record) should be unreachable in the current
-    /// system; it's kept as a defensive fallback, and as a bridge for
-    /// records left over from mUSDC's pre-#578 life as a plain SAC before a
-    /// live-holder migration, if one hasn't run yet.
+    /// This function is a pure view and does not mutate storage. Cleanup of
+    /// stale records for zero-share addresses occurs during state-changing
+    /// operations (`deposit`, `withdraw`, `on_transfer`).
     pub fn get_principal(env: Env, address: Address) -> i128 {
         if Self::get_position(env.clone(), address.clone()) == 0 {
-            clear_position_records(&env, &address);
             return 0;
         }
         let key = DataKey::Principal(address);
@@ -2557,6 +2546,58 @@ mod tests {
 
         assert_eq!(vault.get_position(&stranger), 0);
         assert_eq!(TokenClient::new(&env, &musdc_id).balance(&stranger), 0);
+    }
+
+    #[test]
+    fn get_entry_time_and_get_principal_are_pure_views_and_do_not_mutate_storage() {
+        let (env, _admin, user, _usdc, _musdc, _adapter, vault) = setup();
+
+        // Even if Entry or Principal keys exist for a zero-share address (e.g. simulated stale state),
+        // querying get_entry_time and get_principal returns 0 without deleting or writing storage.
+        env.as_contract(&vault.address, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Entry(user.clone()), &99_999_u64);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Principal(user.clone()), &500_0000000_i128);
+        });
+
+        assert_eq!(vault.get_position(&user), 0);
+        assert_eq!(vault.get_entry_time(&user), 0);
+        assert_eq!(vault.get_principal(&user), 0);
+
+        // Confirm keys were NOT cleared by the view reads
+        env.as_contract(&vault.address, || {
+            assert_eq!(
+                env.storage().persistent().get(&DataKey::Entry(user.clone())),
+                Some(99_999_u64)
+            );
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::Principal(user.clone())),
+                Some(500_0000000_i128)
+            );
+        });
+
+        // When a clean address with no prior records is queried, it also returns 0 and does not write
+        let clean = Address::generate(&env);
+        assert_eq!(vault.get_entry_time(&clean), 0);
+        assert_eq!(vault.get_principal(&clean), 0);
+        env.as_contract(&vault.address, || {
+            assert!(!env.storage().persistent().has(&DataKey::Entry(clean.clone())));
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::Principal(clean.clone())));
+        });
+
+        // When user deposits, deposit() clears the stale records and sets fresh ones
+        env.ledger().with_mut(|li| li.timestamp = 2_000);
+        vault.deposit(&user, &100_0000000_i128, &0_i128);
+        assert_eq!(vault.get_entry_time(&user), 2_000);
+        assert_eq!(vault.get_principal(&user), 100_0000000_i128);
     }
 
     #[test]
